@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Chat WebSocket</title>
+    <!-- import bootstrap -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body>
+    <div id="chat-sala_geral">
+        <h3>Sala Geral</h3>
+        <div id="chat_messages-sala_geral">
+        </div>
+        <input type="text" id="input-sala_geral" placeholder="Digite sua mensagem..." class="form-control">
+        <button id="send-sala_geral" class="btn btn-primary mt-2">Enviar</button>
+    </div>
+
+    <div id="chat-sala_devs" class="mt-4">
+        <h3>Sala Devs</h3>
+        <div id="chat_messages-sala_devs">
+        </div>
+        <input type="text" id="input-sala_devs" placeholder="Digite sua mensagem..." class="form-control">
+        <button id="send-sala_devs" class="btn btn-primary mt-2">Enviar</button>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const USER_ID = "42";
+        const CHATS = ["sala_geral", "sala_devs"];
+
+        const url = `ws://localhost:8765/ws?user_id=${USER_ID}&chats=${CHATS.join(",")}`;
+        const ws = new WebSocket(url);
+
+
+        ws.onopen = () => {
+            console.log("Conectado como user:", USER_ID);
+            console.log("Subscrito em:", CHATS);
+        };
+
+        ws.onclose = (event) => {
+            console.log("Desconectado. Código:", event.code);
+        };
+
+        ws.onerror = (err) => {
+            console.error("Erro na conexão:", err);
+        };
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+
+            switch (msg.type) {
+                case "message":
+                    receberMensagem(msg);
+                    break;
+
+                default:
+                    console.warn("Tipo de mensagem desconhecido:", msg.type);
+            }
+        };
+
+        function receberMensagem({ chat_id, user_id, text }) {
+            // (o servidor já filtra, mas é boa prática validar no cliente também)
+            if (!CHATS.includes(chat_id)) return;
+
+            console.log(`[${chat_id}] ${user_id}: ${text}`);
+
+            // exibindo mensagem no chat
+            const container = $(`#chat_messages-${chat_id}`);
+            if (container) {
+                container.append(`<div><strong>${user_id}:</strong><br>${text}</div>`);
+            }
+        }
+
+        function enviarMensagem(chatId, texto) {
+            if (ws.readyState !== WebSocket.OPEN) {
+                console.warn("WebSocket não está aberto. Estado:", ws.readyState);
+                return;
+            }
+
+            const payload = JSON.stringify({
+                chat_id: chatId,
+                text: texto,
+            });
+
+            ws.send(payload);
+        }
+
+        window.addEventListener("beforeunload", () => {
+            ws.close(1000, "página fechada");
+        });
+
+        $(document).ready(() => {
+            // qualquer input que comece com "input-" e botão "send-" correspondente
+            $(document).on("click", "button[id^='send-']", function () {
+                const chatId = this.id.replace("send-", "");
+                const input = $(`#input-${chatId}`);
+                const text = input.val().trim();
+                if (text) {
+                    $("#chat_messages-" + chatId).append(`<div><strong>Você:</strong><br>${text}</div>`);
+                    enviarMensagem(chatId, text);
+                    input.val("");
+                }
+            });
+        });
+    </script>
+</body>
+
+</html>
