@@ -1,19 +1,14 @@
-import socket
-import threading
+import asyncio
 import hashlib
 import base64
 import json
 import struct
 
-chat_subscriptions: dict[str, set[socket.socket]] = {}
-client_meta: dict[socket.socket, dict] = {}
-subscriptions_lock = threading.Lock()
+# Estruturas de dados (Não precisam mais de Lock no asyncio)
+chat_subscriptions: dict[str, set[asyncio.StreamWriter]] = {}
+client_meta: dict[asyncio.StreamWriter, dict] = {}
 
 def parse_handshake(data: bytes) -> dict:
-    """
-    Extrai headers HTTP do handshake e os query params da URL.
-    O cliente conecta em: ws://host/ws?user_id=42&chats=room1,room2,room3
-    """
     lines = data.decode("utf-8").split("\r\n")
     headers = {}
     request_line = lines[0]
@@ -23,8 +18,7 @@ def parse_handshake(data: bytes) -> dict:
             key, val = line.split(": ", 1)
             headers[key.lower()] = val
 
-    # Extrai query string da URL
-    path = request_line.split(" ")[1]  # "/ws?user_id=42&chats=room1,room2"
+    path = request_line.split(" ")[1]
     query_params = {}
     if "?" in path:
         qs = path.split("?", 1)[1]
@@ -35,26 +29,18 @@ def parse_handshake(data: bytes) -> dict:
 
     return {"headers": headers, "params": query_params}
 
-def perform_handshake(conn: socket.socket, data: bytes) -> dict | None:
-    """
-    Completa o handshake WebSocket (RFC 6455) e retorna os metadados do cliente.
-    Retorna None se o handshake falhar.
-    """
+async def perform_handshake(writer: asyncio.StreamWriter, data: bytes) -> dict | None:
     parsed = parse_handshake(data)
     headers = parsed["headers"]
     params = parsed["params"]
 
     if "sec-websocket-key" not in headers:
-        conn.send(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await writer.drain()
         return None
 
     user_id = params.get("user_id")
-    if not user_id:
-        conn.send(b"HTTP/1.1 400 Bad Request\r\n\r\nMissing user_id\n")
-        return None
-
-    chat_ids_raw = params.get("chats", "")
-    chat_ids = [c.strip() for c in chat_ids_raw.split(",") if c.strip()]
+    chat_ids = [c.strip() for c in params.get("chats", "").split(",") if c.strip()]
 
     magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     key = headers["sec-websocket-key"] + magic
@@ -64,18 +50,15 @@ def perform_handshake(conn: socket.socket, data: bytes) -> dict | None:
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n"
-        "\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
     )
-    conn.send(response.encode())
+    writer.write(response.encode())
+    await writer.drain()
 
     return {"user_id": user_id, "chat_ids": chat_ids}
 
 def decode_frame(data: bytes) -> dict | None:
-    """Decodifica um frame WebSocket recebido do cliente. Retorna None se o frame for inválido."""
-    if len(data) < 2:
-        return None
-
+    if len(data) < 2: return None
     fin = (data[0] >> 7) & 1
     opcode = data[0] & 0x0F
     masked = (data[1] >> 7) & 1
@@ -89,23 +72,18 @@ def decode_frame(data: bytes) -> dict | None:
         payload_len = struct.unpack(">Q", data[offset:offset+8])[0]
         offset += 8
 
-    mask_key = b""
     if masked:
         mask_key = data[offset:offset+4]
         offset += 4
+        payload = bytearray(data[offset:offset+payload_len])
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    else:
+        payload = data[offset:offset+payload_len]
 
-    payload = bytearray(data[offset:offset+payload_len])
-    if masked:
-        payload = bytearray(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-
-    return {"opcode": opcode, "payload": bytes(payload), "fin": fin}
-
+    return {"opcode": opcode, "payload": payload, "fin": fin}
 
 def encode_frame(message: str | bytes) -> bytes:
-    """Encoda um frame WebSocket texto."""
-    if isinstance(message, str):
-        message = message.encode("utf-8")
-
+    if isinstance(message, str): message = message.encode("utf-8")
     length = len(message)
     if length <= 125:
         header = bytes([0x81, length])
@@ -113,133 +91,96 @@ def encode_frame(message: str | bytes) -> bytes:
         header = bytes([0x81, 126]) + struct.pack(">H", length)
     else:
         header = bytes([0x81, 127]) + struct.pack(">Q", length)
-
     return header + message
 
-def subscribe(conn: socket.socket, chat_ids: list[str]):
-    """
-    Registra a conexão nos chats desejados.
-    Usa lock para garantir exclusão mútua (thread-safety).
-    """
-    with subscriptions_lock:
-        for chat_id in chat_ids:
-            if chat_id not in chat_subscriptions:
-                chat_subscriptions[chat_id] = set()
-            chat_subscriptions[chat_id].add(conn)
-    print(f"[subscriptions] {conn.getpeername()} -> chats: {chat_ids}")
+async def subscribe(writer: asyncio.StreamWriter, chat_ids: list[str]):
+    for chat_id in chat_ids:
+        if chat_id not in chat_subscriptions:
+            chat_subscriptions[chat_id] = set()
+        chat_subscriptions[chat_id].add(writer)
 
+async def unsubscribe(writer: asyncio.StreamWriter):
+    for chat_id in list(chat_subscriptions.keys()):
+        chat_subscriptions[chat_id].discard(writer)
+        if not chat_subscriptions[chat_id]:
+            del chat_subscriptions[chat_id]
+    client_meta.pop(writer, None)
 
-def unsubscribe(conn: socket.socket):
-    """Remove a conexão de todos os chats ao desconectar."""
-    with subscriptions_lock:
-        for chat_id in list(chat_subscriptions.keys()):
-            chat_subscriptions[chat_id].discard(conn)
-            if not chat_subscriptions[chat_id]:
-                del chat_subscriptions[chat_id]
-        client_meta.pop(conn, None)
-    print(f"[subscriptions] conexão removida: {conn.getpeername()}")
-
-def publish(chat_id: str, payload: dict, sender_conn: socket.socket):
-    """
-    Envia a mensagem para todos os subscribers do chat,
-    exceto o remetente (comportamento típico de chat).
-    """
-    with subscriptions_lock:
-        subscribers = set(chat_subscriptions.get(chat_id, set()))
-
+async def publish(chat_id: str, payload: dict, sender_writer: asyncio.StreamWriter):
+    subscribers = chat_subscriptions.get(chat_id, set())
     frame = encode_frame(json.dumps(payload, ensure_ascii=False))
-
-    dead_conns = []
-    for conn in subscribers:
-        if conn is sender_conn:
-            continue  # não envia de volta ao remetente
+    
+    # Criamos uma lista de tarefas de escrita para enviar em paralelo
+    tasks = []
+    for writer in subscribers:
+        if writer is sender_writer:
+            continue
         try:
-            conn.sendall(frame)
-        except (BrokenPipeError, OSError):
-            dead_conns.append(conn)
+            writer.write(frame)
+            tasks.append(writer.drain()) # Aguarda o buffer de rede
+        except Exception:
+            continue
+    
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Limpeza lazy de conexões mortas
-    for conn in dead_conns:
-        unsubscribe(conn)
-
-def handle_client(conn: socket.socket, addr):
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    addr = writer.get_extra_info('peername')
     print(f"[+] Nova conexão: {addr}")
+    
     try:
-        # 1. Receber handshake HTTP
-        raw = conn.recv(4096)
-        if not raw:
-            return
+        # 1. Handshake
+        raw = await reader.read(4096)
+        if not raw: return
 
-        meta = perform_handshake(conn, raw)
-        if not meta:
-            return
+        meta = await perform_handshake(writer, raw)
+        if not meta: return
 
-        user_id = meta["user_id"]
-        chat_ids = meta["chat_ids"]
+        client_meta[writer] = meta
+        await subscribe(writer, meta["chat_ids"])
 
-        # 2. Registrar subscrições
-        with subscriptions_lock:
-            client_meta[conn] = meta
-        subscribe(conn, chat_ids)
-
-        print(f"[handshake] user={user_id} subscribed to {chat_ids}")
-
-        # 3. Loop de leitura de mensagens
+        # 2. Loop de Mensagens
         while True:
-            data = conn.recv(4096)
-            if not data:
-                break
+            data = await reader.read(4096)
+            if not data: break
 
             frame = decode_frame(data)
-            if frame is None:
-                continue
+            if not frame or frame["opcode"] == 8: break # Close
 
-            # Opcode 8 = close frame
-            if frame["opcode"] == 8:
-                break
-
-            # Opcode 1 = text frame
             if frame["opcode"] == 1:
                 try:
                     msg = json.loads(frame["payload"].decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
+                    chat_id = msg.get("chat_id")
+                    text = msg.get("text")
 
-                chat_id = msg.get("chat_id")
-                text = msg.get("text")
-
-                if not chat_id or not text:
-                    continue
-
-                envelope = {
-                    "type": "message",
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "text": text,
-                }
-
-                print(f"[msg] user={user_id} chat={chat_id}: {text}")
-                publish(chat_id, envelope, sender_conn=conn)
+                    if chat_id and text:
+                        envelope = {
+                            "type": "message",
+                            "chat_id": chat_id,
+                            "user_id": meta["user_id"],
+                            "text": text,
+                        }
+                        await publish(chat_id, envelope, sender_writer=writer)
+                except Exception as e:
+                    print(f"[msg erro] {e}")
 
     except Exception as e:
         print(f"[erro] {addr}: {e}")
     finally:
-        unsubscribe(conn)
-        conn.close()
+        await unsubscribe(writer)
+        writer.close()
+        await writer.wait_closed()
         print(f"[-] Desconectado: {addr}")
 
-def start_server(host="0.0.0.0", port=8765):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(50)
-    print(f"[server] Escutando em {host}:{port}")
-
-    while True:
-        conn, addr = server.accept()
-        thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-        thread.start()
-
+async def main():
+    server = await asyncio.start_server(handle_client, '0.0.0.0', 8765)
+    addr = server.sockets[0].getsockname()
+    print(f"[server] Escutando em {addr}")
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
-    start_server()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
