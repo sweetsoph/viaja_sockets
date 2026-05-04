@@ -4,6 +4,11 @@ import hashlib
 import base64
 import json
 import struct
+from pyngrok import ngrok
+import os
+
+NGROK_AUTH_TOKEN = os.getenv('NGROK_WS_TOKEN')
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
 
 chat_subscriptions: dict[str, set[socket.socket]] = {}
 client_meta: dict[socket.socket, dict] = {}
@@ -233,13 +238,15 @@ def start_server(host="0.0.0.0", port=8765):
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
     server.listen(50)
-    print(f"[server] Escutando em {host}:{port}")
+    print(f"[server] Servidor rodando localmente em {host}:{port}")
 
     while True:
         conn, addr = server.accept()
         thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
         thread.start()
 
+public_url = ngrok.connect(8765, "tcp")
+print(f"[server] Túnel ngrok aberto: {public_url}")
 
-if __name__ == "__main__":
-    start_server()
+server_thread = threading.Thread(target=start_server, daemon=True)
+server_thread.start()
