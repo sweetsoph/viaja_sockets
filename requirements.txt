@@ -1,4 +1,6 @@
+load-dotenv==0.1.0
 pygrok==1.0.0
 pyngrok==8.1.2
+python-dotenv==1.2.2
 PyYAML==6.0.3
 regex==2026.4.4
