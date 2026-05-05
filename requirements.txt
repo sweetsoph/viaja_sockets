@@ -1,0 +1,4 @@
+pygrok==1.0.0
+pyngrok==8.1.2
+PyYAML==6.0.3
+regex==2026.4.4
