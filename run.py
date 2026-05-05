@@ -4,6 +4,7 @@ import hashlib
 import base64
 import json
 import struct
+import time
 from pyngrok import ngrok
 from dotenv import load_dotenv
 import os
@@ -15,7 +16,13 @@ ngrok.set_auth_token(NGROK_AUTH_TOKEN)
 
 chat_subscriptions: dict[str, set[socket.socket]] = {}
 client_meta: dict[socket.socket, dict] = {}
+
+# Novo: status por (chat_id, user_id) -> {"status": "online"|"typing"|"offline", "since": timestamp}
+user_status: dict[tuple[str, str], dict] = {}
+typing_timers: dict[tuple[str, str], threading.Timer] = {}
 subscriptions_lock = threading.Lock()
+
+TYPING_TIMEOUT = 4.0
 
 def parse_handshake(data: bytes) -> dict:
     """
@@ -147,10 +154,11 @@ def unsubscribe(conn: socket.socket):
         client_meta.pop(conn, None)
     print(f"[subscriptions] conexão removida: {conn.getpeername()}")
 
-def publish(chat_id: str, payload: dict, sender_conn: socket.socket):
+def publish(chat_id: str, payload: dict, sender_conn: socket.socket | None = None):
     """
-    Envia a mensagem para todos os subscribers do chat,
-    exceto o remetente (comportamento típico de chat).
+    Envia para todos os subscribers do chat.
+    sender_conn=None para broadcasts de sistema (presença), assim o
+    próprio usuário também recebe a confirmação do seu status.
     """
     with subscriptions_lock:
         subscribers = set(chat_subscriptions.get(chat_id, set()))
@@ -160,18 +168,103 @@ def publish(chat_id: str, payload: dict, sender_conn: socket.socket):
     dead_conns = []
     for conn in subscribers:
         if conn is sender_conn:
-            continue  # não envia de volta ao remetente
+            continue
         try:
             conn.sendall(frame)
         except (BrokenPipeError, OSError):
             dead_conns.append(conn)
 
-    # Limpeza lazy de conexões mortas
     for conn in dead_conns:
         unsubscribe(conn)
 
+def _set_status(chat_id: str, user_id: str, status: str):
+    """Atualiza o dicionário de status (deve ser chamado com o lock já adquirido)."""
+    key = (chat_id, user_id)
+    user_status[key] = {"status": status, "since": time.time()}
+
+
+def broadcast_status(chat_id: str, user_id: str, status: str, sender_conn: socket.socket | None = None):
+    """
+    Grava o status e avisa todos os participantes do chat.
+    status: "online" | "typing" | "offline"
+    """
+    with subscriptions_lock:
+        _set_status(chat_id, user_id, status)
+
+    envelope = {
+        "type": "presence",
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "status": status,
+        "ts": time.time(),
+    }
+    publish(chat_id, envelope, sender_conn=sender_conn)
+    print(f"[presence] user={user_id} chat={chat_id} -> {status}")
+
+
+def handle_typing(chat_id: str, user_id: str, conn: socket.socket):
+    """
+    Chamado sempre que o cliente envia um evento {"type":"typing","chat_id":"..."}.
+    - Muda status para "typing" imediatamente.
+    - Reinicia o timer: se não vier novo evento em TYPING_TIMEOUT segundos,
+      volta automaticamente para "online".
+    """
+    key = (chat_id, user_id)
+    
+    with subscriptions_lock:
+        old_timer = typing_timers.pop(key, None)
+    if old_timer:
+        old_timer.cancel()
+
+    with subscriptions_lock:
+        current = user_status.get(key, {}).get("status")
+
+    if current != "typing":
+        broadcast_status(chat_id, user_id, "typing", sender_conn=conn)
+
+    # Agenda retorno automático para "online"
+    def _revert_to_online():
+        with subscriptions_lock:
+            typing_timers.pop(key, None)
+        broadcast_status(chat_id, user_id, "online", sender_conn=conn)
+
+    timer = threading.Timer(TYPING_TIMEOUT, _revert_to_online)
+    timer.daemon = True
+
+    with subscriptions_lock:
+        typing_timers[key] = timer
+
+    timer.start()
+
+
+def broadcast_online_all_chats(user_id: str, chat_ids: list[str], conn: socket.socket):
+    """Anuncia 'online' em todos os chats do usuário ao conectar."""
+    for chat_id in chat_ids:
+        broadcast_status(chat_id, user_id, "online", sender_conn=conn)
+
+
+def broadcast_offline_all_chats(user_id: str, chat_ids: list[str]):
+    """
+    Anuncia 'offline' em todos os chats e cancela timers de typing pendentes.
+    Chamado no finally do handle_client.
+    """
+    for chat_id in chat_ids:
+        key = (chat_id, user_id)
+
+        # Cancela timer de typing se existir
+        with subscriptions_lock:
+            timer = typing_timers.pop(key, None)
+            user_status.pop(key, None)
+        if timer:
+            timer.cancel()
+
+        broadcast_status(chat_id, user_id, "offline", sender_conn=None)
+
 def handle_client(conn: socket.socket, addr):
     print(f"[+] Nova conexão: {addr}")
+    user_id  = None
+    chat_ids = []
+
     try:
         # 1. Receber handshake HTTP
         raw = conn.recv(4096)
@@ -190,9 +283,11 @@ def handle_client(conn: socket.socket, addr):
             client_meta[conn] = meta
         subscribe(conn, chat_ids)
 
+        # 3. Anuncia "online" em todos os chats ao conectar
+        broadcast_online_all_chats(user_id, chat_ids, conn)
         print(f"[handshake] user={user_id} subscribed to {chat_ids}")
 
-        # 3. Loop de leitura de mensagens
+        # 4. Loop de leitura de mensagens
         while True:
             data = conn.recv(4096)
             if not data:
@@ -214,24 +309,54 @@ def handle_client(conn: socket.socket, addr):
                     continue
 
                 chat_id = msg.get("chat_id")
-                text = msg.get("text")
+                msg_type = msg.get("type", "message")
 
-                if not chat_id or not text:
+                if not chat_id:
                     continue
 
-                envelope = {
-                    "type": "message",
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "text": text,
-                }
+                if msg_type == "typing":
+                    handle_typing(chat_id, user_id, conn)
+                    continue
 
-                print(f"[msg] user={user_id} chat={chat_id}: {text}")
-                publish(chat_id, envelope, sender_conn=conn)
+                if msg_type == "stop_typing":
+                    key = (chat_id, user_id)
+                    with subscriptions_lock:
+                        timer = typing_timers.pop(key, None)
+                    if timer:
+                        timer.cancel()
+                    broadcast_status(chat_id, user_id, "online", sender_conn=conn)
+                    continue
+                
+                if msg_type == "message":
+                    text = msg.get("text")
+                    if not text:
+                        continue
+
+                    # Enviar uma mensagem cancela o estado "typing"
+                    key = (chat_id, user_id)
+                    with subscriptions_lock:
+                        timer = typing_timers.pop(key, None)
+                    if timer:
+                        timer.cancel()
+                    broadcast_status(chat_id, user_id, "online", sender_conn=conn)
+
+                    envelope = {
+                        "type": "message",
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "text": text,
+                        "ts": time.time(),
+                    }
+
+                    print(f"[msg] user={user_id} chat={chat_id}: {text}")
+                    publish(chat_id, envelope, sender_conn=conn)
 
     except Exception as e:
         print(f"[erro] {addr}: {e}")
     finally:
+        if user_id:
+            # Anuncia "offline" em todos os chats ao desconectar
+            broadcast_offline_all_chats(user_id, chat_ids)
         unsubscribe(conn)
         conn.close()
         print(f"[-] Desconectado: {addr}")
@@ -251,5 +376,4 @@ def start_server(host="0.0.0.0", port=8765):
 public_url = ngrok.connect(8765, "tcp")
 print(f"[server] Túnel ngrok aberto: {public_url}")
 
-server_thread = threading.Thread(target=start_server, daemon=True)
-server_thread.start()
+start_server()
